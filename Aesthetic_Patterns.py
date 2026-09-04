@@ -5,7 +5,6 @@ Photo Pattern Generator for TikTok (Improved)
 import math
 import random
 import shutil
-import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -50,13 +49,14 @@ def extract_pool(source_folders: list[str]) -> tuple[list[Path], dict[Path, str]
 
     for folder in source_folders:
         available_photos = get_photos(folder)
-        quantity = max(1, int(len(available_photos) * MAX_FRACTION_PER_FOLDER))
+        max_allowed = max(1, int(len(available_photos) * MAX_FRACTION_PER_FOLDER))
+        quantity = random.randint(1, max_allowed)
         selected = random.sample(available_photos, quantity)
-        
+
         pool.extend(selected)
         for photo in selected:
             folder_of[photo] = folder
-        print(f"  → {quantity}/{len(available_photos)} photos taken from '{folder}'")
+        print(f"  → {quantity}/{len(available_photos)} photos taken from '{folder}' (max allowed: {max_allowed})")
 
     return pool, folder_of
 
@@ -120,6 +120,35 @@ def cluster_by_aesthetic(photos: list[Path], num_clusters: int):
     return clusters, kmeans, feature_by_photo, valid_photos
 
 
+def balanced_allocate(counts: dict[str, int], n: int) -> dict[str, int]:
+    """
+    Splits n slots across folders as evenly as possible, respecting each
+    folder's available count. Works round-robin: each eligible folder gets
+    +1 per pass (in randomized order), so any leftover from integer
+    division is spread out instead of dumped on whichever folder happened
+    to be sorted first. Returns fewer than n total only if every folder
+    runs out of supply first.
+    """
+    allocation = {folder: 0 for folder in counts}
+    folders = list(counts.keys())
+    total_allocated = 0
+
+    while total_allocated < n:
+        made_progress = False
+        random.shuffle(folders)
+        for folder in folders:
+            if total_allocated >= n:
+                break
+            if allocation[folder] < counts[folder]:
+                allocation[folder] += 1
+                total_allocated += 1
+                made_progress = True
+        if not made_progress:
+            break  # every folder is fully used up
+
+    return allocation
+
+
 def widen_cluster(
     cluster_photos: list[Path],
     cluster_id: int,
@@ -128,8 +157,20 @@ def widen_cluster(
     all_photos: list[Path],
     target_size: int,
     folder_of: dict[Path, str] | None = None,
-    max_fraction_per_folder: float | None = None,
 ) -> list[Path]:
+    """
+    If a cluster has fewer photos than target_size, widen it by pulling in
+    the closest-matching photos from the rest of the pool. Those photos
+    aren't removed from their original cluster — they're simply also
+    considered a reasonable match for this one.
+
+    The extra photos are borrowed in a balanced way: rather than just
+    grabbing whichever photos are closest overall (which could pull, say,
+    7 from one folder and 2 from another), the shortfall is split as
+    evenly as possible across the folders that have a matching photo
+    available. Within each folder, the closest aesthetic match is still
+    picked first.
+    """
     if len(cluster_photos) >= target_size:
         return cluster_photos
 
@@ -144,32 +185,21 @@ def widen_cluster(
     needed = target_size - len(cluster_photos)
     borrowed: list[Path] = []
 
-    if folder_of is not None and max_fraction_per_folder is not None:
-        max_per_folder = max(1, math.floor(max_fraction_per_folder * target_size))
-        counts = defaultdict(int)
-        for p in cluster_photos:
-            counts[folder_of.get(p, "unknown")] += 1
-
+    if folder_of is not None:
+        candidates_by_folder: dict[str, list[Path]] = defaultdict(list)
         for p in candidates_sorted:
-            if len(borrowed) >= needed:
-                break
-            folder = folder_of.get(p, "unknown")
-            if counts[folder] < max_per_folder:
-                borrowed.append(p)
-                counts[folder] += 1
+            candidates_by_folder[folder_of.get(p, "unknown")].append(p)
 
-        if len(borrowed) < needed:
-            already_borrowed = set(borrowed)
-            for p in candidates_sorted:
-                if len(borrowed) >= needed:
-                    break
-                if p not in already_borrowed:
-                    borrowed.append(p)
+        available_counts = {folder: len(photos) for folder, photos in candidates_by_folder.items()}
+        allocation = balanced_allocate(available_counts, needed)
+
+        for folder, count in allocation.items():
+            borrowed.extend(candidates_by_folder[folder][:count])
     else:
         borrowed = candidates_sorted[:needed]
 
     if borrowed:
-        print(f"  ↳ Widening group: added {len(borrowed)} matching photos.")
+        print(f"  ↳ Widening group: added {len(borrowed)} matching photos (balanced across folders).")
 
     return cluster_photos + borrowed
 
@@ -257,6 +287,13 @@ def generate_patterns(
         generated_patterns.add(pattern)
         attempts += 1
 
+    if len(generated_patterns) < num_patterns:
+        print(
+            f"  ⚠ Only {len(generated_patterns)} unique patterns could be generated "
+            f"(asked for {num_patterns}). With {len(photos)} photos and {photos_per_pattern} "
+            f"per pattern, the possible combinations are limited."
+        )
+
     return list(generated_patterns)
 
 
@@ -304,7 +341,7 @@ def run_aesthetic_mode():
         cluster_name = f"aesthetic_{cluster_id + 1:02d}"
         working_photos = widen_cluster(
             cluster_photos, cluster_id, kmeans, feature_by_photo, valid_photos, PHOTOS_PER_PATTERN,
-            folder_of=folder_of, max_fraction_per_folder=MAX_FRACTION_PER_FOLDER,
+            folder_of=folder_of,
         )
 
         patterns = generate_patterns(
@@ -319,6 +356,8 @@ def main():
         run_random_mode()
     elif MODE == "aesthetic":
         run_aesthetic_mode()
+    else:
+        raise ValueError(f"Invalid MODE: '{MODE}'. Use 'random' or 'aesthetic'.")
 
 if __name__ == "__main__":
     main()

@@ -4,7 +4,6 @@ Photo Pattern Generator for TikTok (Improved)
 
 import math
 import random
-import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -12,7 +11,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 MODE = "aesthetic"
@@ -25,66 +23,10 @@ SOURCE_FOLDERS = [
 OUTPUT_FOLDER = r"D:\photos\prueba 2"      
 NUM_PATTERNS = 2                
 PHOTOS_PER_PATTERN = 6          
-NUM_AESTHETIC_CLUSTERS = "auto"  # int for a fixed number, or "auto" to let the script decide
+NUM_AESTHETIC_CLUSTERS = 2       
 MAX_FRACTION_PER_FOLDER = 2 / 3  
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
 ANALYSIS_THUMBNAIL_SIZE = (100, 100) 
-
-# Optional format filter — leave both as None to use every photo regardless
-# of shape (default behavior, nothing changes if you don't touch these).
-#   ORIENTATION_FILTER: None, "horizontal", "vertical", or "square"
-#   ASPECT_RATIO_FILTER: None, or a specific ratio as "W:H", e.g. "9:16",
-#     "4:5", "3:4", "1:1", "16:9". Only meaningful once ORIENTATION_FILTER
-#     narrows things down to one orientation — e.g. set ORIENTATION_FILTER
-#     to "vertical" and ASPECT_RATIO_FILTER to "9:16" to keep only
-#     vertical photos close to that specific shape.
-ORIENTATION_FILTER = None
-ASPECT_RATIO_FILTER = None
-ASPECT_RATIO_TOLERANCE = 0.05  # allow 5% wiggle room so near-matches still count
-
-
-def get_image_dimensions(photo_path: Path) -> tuple[int, int]:
-    with Image.open(photo_path) as img:
-        return img.size  # (width, height)
-
-
-def get_orientation(width: int, height: int) -> str:
-    if width > height:
-        return "horizontal"
-    if height > width:
-        return "vertical"
-    return "square"
-
-
-def matches_aspect_ratio(width: int, height: int, ratio_str: str, tolerance: float) -> bool:
-    try:
-        w_part, h_part = ratio_str.split(":")
-        target_ratio = float(w_part) / float(h_part)
-    except (ValueError, ZeroDivisionError):
-        raise ValueError(f"Invalid ASPECT_RATIO_FILTER format: '{ratio_str}'. Use 'W:H', e.g. '9:16'.")
-
-    actual_ratio = width / height
-    return abs(actual_ratio - target_ratio) / target_ratio <= tolerance
-
-
-def passes_format_filter(photo_path: Path) -> bool:
-    if ORIENTATION_FILTER is None and ASPECT_RATIO_FILTER is None:
-        return True  # no filter configured — don't even bother opening the file
-
-    try:
-        width, height = get_image_dimensions(photo_path)
-    except Exception:
-        return False  # unreadable image, exclude it rather than crash
-
-    if ORIENTATION_FILTER is not None and get_orientation(width, height) != ORIENTATION_FILTER:
-        return False
-
-    if ASPECT_RATIO_FILTER is not None and not matches_aspect_ratio(
-        width, height, ASPECT_RATIO_FILTER, ASPECT_RATIO_TOLERANCE
-    ):
-        return False
-
-    return True
 
 
 def get_photos(folder: str) -> list[Path]:
@@ -92,85 +34,29 @@ def get_photos(folder: str) -> list[Path]:
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder '{folder}' does not exist")
 
-    all_photos = [
-        f for f in folder_path.rglob("*")
+    photos = [
+        f for f in folder_path.iterdir()
         if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS
     ]
-
-    if ORIENTATION_FILTER is None and ASPECT_RATIO_FILTER is None:
-        photos = all_photos
-    else:
-        photos = [p for p in all_photos if passes_format_filter(p)]
-        excluded = len(all_photos) - len(photos)
-        if excluded > 0:
-            print(f"  (filtered out {excluded} photos in '{folder}' not matching the format filter)")
-
     if not photos:
-        raise ValueError(f"No valid photos matching the current filters were found in '{folder}'")
+        raise ValueError(f"No valid photos were found in '{folder}'")
     return photos
 
 
-def extract_pool(source_folders: list[str], min_total: int | None = None) -> tuple[list[Path], dict[Path, str]]:
-    """
-    Randomly extracts photos from each folder (1 to 2/3 of what's there).
-    If min_total is given and the random draw comes up short of it overall
-    (bad luck can make every folder roll a low number), it tops folders up
-    — respecting their individual max_allowed cap — until min_total is
-    reached, or raises a clear error if that's not physically possible.
-    """
-    available_by_folder: dict[str, list[Path]] = {}
-    max_allowed_by_folder: dict[str, int] = {}
-    quantity_by_folder: dict[str, int] = {}
-
-    for folder in source_folders:
-        available_photos = get_photos(folder)
-        max_allowed = max(1, int(len(available_photos) * MAX_FRACTION_PER_FOLDER))
-        available_by_folder[folder] = available_photos
-        max_allowed_by_folder[folder] = max_allowed
-        quantity_by_folder[folder] = random.randint(1, max_allowed)
-
-    total = sum(quantity_by_folder.values())
-
-    if min_total is not None and total < min_total:
-        folders_cycle = list(source_folders)
-        while total < min_total:
-            made_progress = False
-            random.shuffle(folders_cycle)
-            for folder in folders_cycle:
-                if total >= min_total:
-                    break
-                if quantity_by_folder[folder] < max_allowed_by_folder[folder]:
-                    quantity_by_folder[folder] += 1
-                    total += 1
-                    made_progress = True
-            if not made_progress:
-                break  # every folder is already at its max_allowed cap
-
-        if total < min_total:
-            max_possible = sum(max_allowed_by_folder.values())
-            raise ValueError(
-                f"Not enough photos available to fill a pattern of {min_total} photos while "
-                f"respecting the {MAX_FRACTION_PER_FOLDER:.0%} per-folder cap "
-                f"(MAX_FRACTION_PER_FOLDER). Maximum obtainable this way: {max_possible} photos. "
-                f"Add more photos to your source folders, raise MAX_FRACTION_PER_FOLDER, "
-                f"or lower PHOTOS_PER_PATTERN."
-            )
-
+def extract_pool(source_folders: list[str]) -> tuple[list[Path], dict[Path, str]]:
     pool: list[Path] = []
     folder_of: dict[Path, str] = {}
 
     for folder in source_folders:
-        available_photos = available_by_folder[folder]
-        quantity = quantity_by_folder[folder]
+        available_photos = get_photos(folder)
+        max_allowed = max(1, int(len(available_photos) * MAX_FRACTION_PER_FOLDER))
+        quantity = random.randint(1, max_allowed)
         selected = random.sample(available_photos, quantity)
 
         pool.extend(selected)
         for photo in selected:
             folder_of[photo] = folder
-        print(
-            f"  → {quantity}/{len(available_photos)} photos taken from '{folder}' "
-            f"(max allowed: {max_allowed_by_folder[folder]})"
-        )
+        print(f"  → {quantity}/{len(available_photos)} photos taken from '{folder}' (max allowed: {max_allowed})")
 
     return pool, folder_of
 
@@ -194,37 +80,7 @@ def analyze_photo(photo_path: Path) -> np.ndarray:
     return np.array([avg_r, avg_g, avg_b, brightness, saturation, warmth])
 
 
-def find_best_cluster_count(scaled_matrix: np.ndarray, k_min: int = 2, k_max: int = 8) -> int:
-    """
-    Tries a range of cluster counts and picks the one with the best
-    silhouette score (a measure of how well-separated and internally
-    tight the clusters are — higher is better, ranges roughly -1 to 1).
-    """
-    n_samples = scaled_matrix.shape[0]
-    k_max = min(k_max, n_samples - 1)  # silhouette needs at least 2 samples per cluster
-
-    if k_max < k_min:
-        fallback = max(2, min(k_min, n_samples))
-        print(f"  ⚠ Not enough photos to try multiple cluster counts, using {fallback}.")
-        return fallback
-
-    best_k = k_min
-    best_score = -1.0
-    print("  Testing possible group counts:")
-    for k in range(k_min, k_max + 1):
-        trial_kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        trial_labels = trial_kmeans.fit_predict(scaled_matrix)
-        score = silhouette_score(scaled_matrix, trial_labels)
-        print(f"    k={k}: silhouette score {score:.3f}")
-        if score > best_score:
-            best_score = score
-            best_k = k
-
-    print(f"  → Best number of aesthetic groups: {best_k} (silhouette score {best_score:.3f})")
-    return best_k
-
-
-def cluster_by_aesthetic(photos: list[Path], num_clusters: int | str):
+def cluster_by_aesthetic(photos: list[Path], num_clusters: int):
     print(f"\nAnalyzing the visual aesthetic of {len(photos)} photos...")
 
     features = []
@@ -236,7 +92,7 @@ def cluster_by_aesthetic(photos: list[Path], num_clusters: int | str):
         except Exception as e:
             print(f"  ⚠ Skipping '{photo.name}': could not analyze it ({e})")
 
-    if num_clusters != "auto" and len(valid_photos) < num_clusters:
+    if len(valid_photos) < num_clusters:
         raise ValueError("Not enough photos to analyze. Reduce NUM_AESTHETIC_CLUSTERS.")
 
     feature_matrix = np.array(features)
@@ -245,9 +101,6 @@ def cluster_by_aesthetic(photos: list[Path], num_clusters: int | str):
     scaler = StandardScaler()
     scaled_matrix = scaler.fit_transform(feature_matrix)
     feature_by_photo = {photo: feat for photo, feat in zip(valid_photos, scaled_matrix)}
-
-    if num_clusters == "auto":
-        num_clusters = find_best_cluster_count(scaled_matrix)
 
     kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
     labels = kmeans.fit_predict(scaled_matrix)
@@ -465,59 +318,21 @@ def save_patterns(patterns: list[tuple[Path, ...]], output_folder: str):
         print(f"  ✔ {pattern_folder.name} created with {len(pattern)} photos")
 
 
-def sanitize_folder_name(name: str) -> str:
-    """
-    Makes a user-typed string safe to use as a single folder name.
-    Replaces path separators (/ and \\) and other characters that are
-    invalid or special on Windows/macOS/Linux filesystems, so something
-    like "2026/2/15" becomes one folder called "2026-2-15" instead of
-    three nested folders (2026 -> 2 -> 15).
-    """
-    invalid_chars = r'[\\/:*?"<>|]'
-    sanitized = re.sub(invalid_chars, "-", name)
-    sanitized = sanitized.strip().strip(".")  # trailing dots/spaces break on Windows
-    return sanitized if sanitized else "batch"
-
-
-def make_run_folder(output_folder: str) -> Path:
-    """
-    Asks the person what to call this batch, then creates exactly ONE
-    folder named "<name>_1" directly inside OUTPUT_FOLDER, incrementing
-    the number each time that name is reused (e.g. "cars_1", "cars_2",
-    ...), so runs never collide or overwrite each other regardless of
-    what name is picked.
-    """
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    raw_name = input("What would you like to name this batch of patterns? ").strip()
-    base_name = sanitize_folder_name(raw_name)
-
-    n = 1
-    while (output_path / f"{base_name}_{n}").exists():
-        n += 1
-    run_path = output_path / f"{base_name}_{n}"
-
-    run_path.mkdir(parents=False, exist_ok=False)  # single folder only, never nested
-    print(f"\nSaving this run's patterns to: {run_path}")
-    return run_path
-
-
 def run_random_mode():
-    pool, folder_of = extract_pool(SOURCE_FOLDERS, min_total=PHOTOS_PER_PATTERN)
+    pool, folder_of = extract_pool(SOURCE_FOLDERS)
     patterns = generate_patterns(
         pool, NUM_PATTERNS, PHOTOS_PER_PATTERN,
         folder_of=folder_of, max_fraction_per_folder=MAX_FRACTION_PER_FOLDER,
     )
-    run_path = make_run_folder(OUTPUT_FOLDER)
-    save_patterns(patterns, str(run_path))
+    save_patterns(patterns, OUTPUT_FOLDER)
 
 
 def run_aesthetic_mode():
-    pool, folder_of = extract_pool(SOURCE_FOLDERS, min_total=PHOTOS_PER_PATTERN)
+    pool, folder_of = extract_pool(SOURCE_FOLDERS)
     clusters, kmeans, feature_by_photo, valid_photos = cluster_by_aesthetic(pool, NUM_AESTHETIC_CLUSTERS)
 
-    run_path = make_run_folder(OUTPUT_FOLDER)
+    output_path = Path(OUTPUT_FOLDER)
+    output_path.mkdir(exist_ok=True)
 
     for cluster_id, cluster_photos in clusters.items():
         if len(cluster_photos) == 0:
@@ -533,21 +348,10 @@ def run_aesthetic_mode():
             working_photos, NUM_PATTERNS, PHOTOS_PER_PATTERN,
             folder_of=folder_of, max_fraction_per_folder=MAX_FRACTION_PER_FOLDER,
         )
-        save_patterns(patterns, str(run_path / cluster_name))
+        save_patterns(patterns, str(output_path / cluster_name))
 
 
 def main():
-    if ASPECT_RATIO_FILTER is not None:
-        matches_aspect_ratio(16, 9, ASPECT_RATIO_FILTER, ASPECT_RATIO_TOLERANCE)  # validates the format early
-
-    if ORIENTATION_FILTER is not None or ASPECT_RATIO_FILTER is not None:
-        parts = []
-        if ORIENTATION_FILTER is not None:
-            parts.append(f"orientation={ORIENTATION_FILTER}")
-        if ASPECT_RATIO_FILTER is not None:
-            parts.append(f"aspect ratio≈{ASPECT_RATIO_FILTER}")
-        print(f"Format filter active: {', '.join(parts)}\n")
-
     if MODE == "random":
         run_random_mode()
     elif MODE == "aesthetic":
@@ -556,7 +360,4 @@ def main():
         raise ValueError(f"Invalid MODE: '{MODE}'. Use 'random' or 'aesthetic'.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except (ValueError, FileNotFoundError) as e:
-        print(f"\n❌ {e}")
+    main()

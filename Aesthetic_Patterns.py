@@ -6,14 +6,21 @@ import math
 import random
 import re
 import shutil
+import warnings
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 from sklearn.cluster import KMeans
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
+
+# Solid/near-solid-color photos legitimately have fewer distinct pixel
+# values than DOMINANT_COLOR_CLUSTERS — sklearn warns about it, but the
+# result is still correct (KMeans handles duplicate points fine).
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 MODE = "aesthetic"
 SOURCE_FOLDERS = [
@@ -41,6 +48,7 @@ ANALYSIS_THUMBNAIL_SIZE = (100, 100)
 ORIENTATION_FILTER = None
 ASPECT_RATIO_FILTER = None
 ASPECT_RATIO_TOLERANCE = 0.05  # allow 5% wiggle room so near-matches still count
+COVER_PHOTO_MODE = False  # if True, each pattern's most vivid photo is placed first (position 1)
 
 
 def get_image_dimensions(photo_path: Path) -> tuple[int, int]:
@@ -175,20 +183,42 @@ def extract_pool(source_folders: list[str], min_total: int | None = None) -> tup
     return pool, folder_of
 
 
+DOMINANT_COLOR_CLUSTERS = 3  # how many candidate colors to consider per photo
+
+
+def get_dominant_color(pixels_flat: np.ndarray, k: int = DOMINANT_COLOR_CLUSTERS) -> np.ndarray:
+    """
+    Finds the most prevalent color in a photo via a quick per-photo
+    k-means, instead of a flat pixel average. This matters for photos
+    with two very different color regions (e.g. half deep red, half
+    white) — a flat average blurs those into a muddy color that
+    represents neither; the dominant cluster picks an actual color that
+    genuinely appears a lot in the image.
+    """
+    photo_kmeans = KMeans(n_clusters=k, random_state=42, n_init=3)
+    labels = photo_kmeans.fit_predict(pixels_flat)
+    counts = np.bincount(labels, minlength=k)
+    dominant_idx = np.argmax(counts)
+    return photo_kmeans.cluster_centers_[dominant_idx]  # [r, g, b], 0-1 range
+
+
 def analyze_photo(photo_path: Path) -> np.ndarray:
     with Image.open(photo_path) as img:
         img = img.convert("RGB")
         img = img.resize(ANALYSIS_THUMBNAIL_SIZE)
         pixels = np.asarray(img, dtype=np.float32) / 255.0
 
-    avg_r = pixels[:, :, 0].mean()
-    avg_g = pixels[:, :, 1].mean()
-    avg_b = pixels[:, :, 2].mean()
-
-    brightness = 0.299 * avg_r + 0.587 * avg_g + 0.114 * avg_b
+    # Brightness and saturation stay as full-image averages — those are
+    # legitimately meaningful as averages (overall exposure / vividness).
+    brightness = (0.299 * pixels[:, :, 0] + 0.587 * pixels[:, :, 1] + 0.114 * pixels[:, :, 2]).mean()
     max_c = pixels.max(axis=2)
     min_c = pixels.min(axis=2)
     saturation = (max_c - min_c).mean()
+
+    # Color and warmth come from the dominant color instead of a flat
+    # average, so multicolor photos are represented by a color that
+    # actually appears in them.
+    avg_r, avg_g, avg_b = get_dominant_color(pixels.reshape(-1, 3))
     warmth = avg_r - avg_b
 
     return np.array([avg_r, avg_g, avg_b, brightness, saturation, warmth])
@@ -444,6 +474,48 @@ def generate_patterns(
     return list(generated_patterns)
 
 
+_vividness_cache: dict[Path, float] = {}
+
+
+def get_vividness_score(photo_path: Path) -> float:
+    """
+    A quick, standalone vividness (saturation) score used only for
+    picking a cover photo — independent of the aesthetic-clustering
+    pipeline so it works in both random and aesthetic mode. Cached since
+    the same photo can show up across multiple patterns.
+    """
+    if photo_path in _vividness_cache:
+        return _vividness_cache[photo_path]
+
+    try:
+        with Image.open(photo_path) as img:
+            img = img.convert("RGB")
+            img = img.resize(ANALYSIS_THUMBNAIL_SIZE)
+            pixels = np.asarray(img, dtype=np.float32) / 255.0
+        max_c = pixels.max(axis=2)
+        min_c = pixels.min(axis=2)
+        score = float((max_c - min_c).mean())
+    except Exception:
+        score = 0.0  # unreadable photo — don't crash, just never pick it as cover
+
+    _vividness_cache[photo_path] = score
+    return score
+
+
+def apply_cover_photo(patterns: list[tuple[Path, ...]]) -> list[tuple[Path, ...]]:
+    """
+    Moves each pattern's most vivid (highest-saturation) photo to
+    position 1 — since that's the first frame a TikTok viewer sees
+    before swiping. The rest of the pattern keeps its existing order.
+    """
+    reordered = []
+    for pattern in patterns:
+        cover = max(pattern, key=get_vividness_score)
+        rest = [p for p in pattern if p != cover]
+        reordered.append((cover, *rest))
+    return reordered
+
+
 def save_patterns(patterns: list[tuple[Path, ...]], output_folder: str):
     output_path = Path(output_folder)
     output_path.mkdir(exist_ok=True, parents=True)
@@ -509,6 +581,8 @@ def run_random_mode():
         pool, NUM_PATTERNS, PHOTOS_PER_PATTERN,
         folder_of=folder_of, max_fraction_per_folder=MAX_FRACTION_PER_FOLDER,
     )
+    if COVER_PHOTO_MODE:
+        patterns = apply_cover_photo(patterns)
     run_path = make_run_folder(OUTPUT_FOLDER)
     save_patterns(patterns, str(run_path))
 
@@ -533,20 +607,50 @@ def run_aesthetic_mode():
             working_photos, NUM_PATTERNS, PHOTOS_PER_PATTERN,
             folder_of=folder_of, max_fraction_per_folder=MAX_FRACTION_PER_FOLDER,
         )
+        if COVER_PHOTO_MODE:
+            patterns = apply_cover_photo(patterns)
         save_patterns(patterns, str(run_path / cluster_name))
 
 
-def main():
-    if ASPECT_RATIO_FILTER is not None:
-        matches_aspect_ratio(16, 9, ASPECT_RATIO_FILTER, ASPECT_RATIO_TOLERANCE)  # validates the format early
+def print_config_summary():
+    print("=" * 60)
+    print("CONFIGURATION")
+    print("=" * 60)
+    print(f"  Mode: {MODE}")
+    print(f"  Source folders ({len(SOURCE_FOLDERS)}):")
+    for folder in SOURCE_FOLDERS:
+        print(f"    - {folder}")
+    print(f"  Output folder: {OUTPUT_FOLDER}")
+
+    if MODE == "aesthetic":
+        print(f"  Aesthetic clusters: {NUM_AESTHETIC_CLUSTERS}")
+        print(f"  Patterns per cluster: {NUM_PATTERNS}")
+    else:
+        print(f"  Patterns to generate: {NUM_PATTERNS}")
+
+    print(f"  Photos per pattern: {PHOTOS_PER_PATTERN}")
+    print(f"  Max photos taken per folder: {MAX_FRACTION_PER_FOLDER:.0%}")
 
     if ORIENTATION_FILTER is not None or ASPECT_RATIO_FILTER is not None:
         parts = []
         if ORIENTATION_FILTER is not None:
             parts.append(f"orientation={ORIENTATION_FILTER}")
         if ASPECT_RATIO_FILTER is not None:
-            parts.append(f"aspect ratio≈{ASPECT_RATIO_FILTER}")
-        print(f"Format filter active: {', '.join(parts)}\n")
+            parts.append(f"aspect ratio≈{ASPECT_RATIO_FILTER} (±{ASPECT_RATIO_TOLERANCE:.0%})")
+        print(f"  Format filter: {', '.join(parts)}")
+    else:
+        print("  Format filter: none")
+
+    print(f"  Cover-photo mode: {'ON (most vivid photo goes first)' if COVER_PHOTO_MODE else 'off'}")
+    print("=" * 60)
+    print()
+
+
+def main():
+    if ASPECT_RATIO_FILTER is not None:
+        matches_aspect_ratio(16, 9, ASPECT_RATIO_FILTER, ASPECT_RATIO_TOLERANCE)  # validates the format early
+
+    print_config_summary()
 
     if MODE == "random":
         run_random_mode()

@@ -2,6 +2,8 @@
 Photo Pattern Generator for TikTok (Improved)
 """
 
+import concurrent.futures
+import json
 import math
 import random
 import re
@@ -49,6 +51,16 @@ ORIENTATION_FILTER = None
 ASPECT_RATIO_FILTER = None
 ASPECT_RATIO_TOLERANCE = 0.05  # allow 5% wiggle room so near-matches still count
 COVER_PHOTO_MODE = False  # if True, each pattern's most vivid photo is placed first (position 1)
+
+# Caching: remembers each photo's analyzed features (color/brightness/etc.)
+# between runs, keyed by file path + modified time + size — so an unchanged
+# photo never gets re-analyzed. Speeds up every run after the first.
+ENABLE_CACHE = True
+CACHE_FILE = "aesthetic_cache.json"
+
+# Parallel analysis: analyzes this many photos at once instead of one at a
+# time. Only affects photos not already in the cache.
+ANALYSIS_WORKERS = 8
 
 
 def get_image_dimensions(photo_path: Path) -> tuple[int, int]:
@@ -254,17 +266,94 @@ def find_best_cluster_count(scaled_matrix: np.ndarray, k_min: int = 2, k_max: in
     return best_k
 
 
+def load_cache() -> dict:
+    if not ENABLE_CACHE:
+        return {}
+    cache_path = Path(CACHE_FILE)
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}  # corrupted or unreadable cache — just start fresh
+
+
+def save_cache(cache: dict) -> None:
+    if not ENABLE_CACHE:
+        return
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError as e:
+        print(f"  ⚠ Could not save analysis cache: {e}")
+
+
+def analyze_photos_batch(photos: list[Path]) -> tuple[list[np.ndarray], list[Path]]:
+    """
+    Analyzes every photo's aesthetic features, skipping any that are
+    already in the cache and unchanged since (same file size and modified
+    time), and analyzing whatever's left in parallel across
+    ANALYSIS_WORKERS threads.
+    """
+    cache = load_cache()
+    features: list[np.ndarray | None] = [None] * len(photos)
+    is_valid = [True] * len(photos)
+    to_analyze: list[tuple[int, Path]] = []
+
+    for i, photo in enumerate(photos):
+        try:
+            stat = photo.stat()
+        except OSError:
+            is_valid[i] = False
+            continue
+
+        key = str(photo.resolve())
+        entry = cache.get(key)
+        if entry and entry.get("mtime") == stat.st_mtime and entry.get("size") == stat.st_size:
+            features[i] = np.array(entry["features"])
+        else:
+            to_analyze.append((i, photo))
+
+    cache_hits = len(photos) - len(to_analyze)
+    if cache_hits:
+        print(f"  {cache_hits} photo(s) found in cache, skipping re-analysis.")
+
+    if to_analyze:
+        print(f"  Analyzing {len(to_analyze)} new/changed photo(s) using {ANALYSIS_WORKERS} workers...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as executor:
+            future_to_item = {executor.submit(analyze_photo, photo): (i, photo) for i, photo in to_analyze}
+            for future in concurrent.futures.as_completed(future_to_item):
+                i, photo = future_to_item[future]
+                try:
+                    feat = future.result()
+                    features[i] = feat
+                    stat = photo.stat()
+                    cache[str(photo.resolve())] = {
+                        "mtime": stat.st_mtime,
+                        "size": stat.st_size,
+                        "features": feat.tolist(),
+                    }
+                except Exception as e:
+                    print(f"  ⚠ Skipping '{photo.name}': could not analyze it ({e})")
+                    is_valid[i] = False
+
+        save_cache(cache)
+
+    valid_features = []
+    valid_photos = []
+    for i, photo in enumerate(photos):
+        if is_valid[i] and features[i] is not None:
+            valid_features.append(features[i])
+            valid_photos.append(photo)
+
+    return valid_features, valid_photos
+
+
 def cluster_by_aesthetic(photos: list[Path], num_clusters: int | str):
     print(f"\nAnalyzing the visual aesthetic of {len(photos)} photos...")
 
-    features = []
-    valid_photos = []
-    for photo in photos:
-        try:
-            features.append(analyze_photo(photo))
-            valid_photos.append(photo)
-        except Exception as e:
-            print(f"  ⚠ Skipping '{photo.name}': could not analyze it ({e})")
+    features, valid_photos = analyze_photos_batch(photos)
 
     if num_clusters != "auto" and len(valid_photos) < num_clusters:
         raise ValueError("Not enough photos to analyze. Reduce NUM_AESTHETIC_CLUSTERS.")
